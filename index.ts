@@ -48,7 +48,6 @@ import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	formatSize,
-	keyHint,
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { execSync } from "node:child_process";
@@ -186,6 +185,8 @@ function createE2bLsOps(getSandbox: () => Sandbox): LsOperations {
 		},
 		stat: async (p: string) => {
 			const sbx = getSandbox();
+			const exists = await sbx.files.exists(p);
+			if (!exists) throw new Error(`ENOENT: no such file or directory, stat '${p}'`);
 			const r = await sbx.commands.run(`test -d ${sq(p)} && echo dir || echo file`, { timeoutMs: 10_000 });
 			const isDir = r.stdout.trim() === "dir";
 			return { isDirectory: () => isDir };
@@ -371,7 +372,6 @@ export default function (pi: ExtensionAPI) {
 	let sandboxTemplate: string | null = null;
 	let startedAt: Date | null = null;
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
-	let lastCtx: { ui: any } | null = null; // stash for shortcut handler
 
 	const getSandbox = (): Sandbox => {
 		if (!sandbox) throw new Error("E2B sandbox not initialised");
@@ -595,7 +595,7 @@ export default function (pi: ExtensionAPI) {
 				if (params.literal) fallbackArgs.push("-F");
 				fallbackArgs.push(sq(params.pattern), sq(searchPath));
 
-				const cmd = `(rg ${args.join(" ")} 2>/dev/null || grep ${fallbackArgs.join(" ")} 2>/dev/null | head -n ${limit}); true`;
+				const cmd = `(rg ${args.join(" ")} 2>/dev/null || grep ${fallbackArgs.join(" ")} 2>/dev/null) | head -n ${limit}; true`;
 
 				let output: string;
 				try {
@@ -662,8 +662,6 @@ export default function (pi: ExtensionAPI) {
 	pi.registerShortcut("ctrl+shift+e", {
 		description: "Toggle E2B cloud sandbox on/off",
 		handler: async (ctx) => {
-			lastCtx = ctx;
-
 			if (sandboxEnabled && sandbox) {
 				// ── Disable ─────────────────────────────────────────────────────
 				const ok = await ctx.ui.confirm(
@@ -705,40 +703,32 @@ export default function (pi: ExtensionAPI) {
 	// ── Events ─────────────────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
+		const e2bFlag = pi.getFlag("e2b") as boolean;
+		const template = pi.getFlag("e2b-template") as string | undefined;
+		const existingSandboxId = pi.getFlag("e2b-sandbox") as string | undefined;
+
+		updateWidget(ctx);
+
+		if (!e2bFlag && !existingSandboxId) return;
+
+		const apiKey = process.env.E2B_API_KEY;
+		if (!apiKey) {
+			safeNotify(ctx, "E2B_API_KEY environment variable is not set!", "error");
+			return;
+		}
+
 		try {
-			lastCtx = ctx;
-			const e2bFlag = pi.getFlag("e2b") as boolean;
-			const template = pi.getFlag("e2b-template") as string | undefined;
-			const existingSandboxId = pi.getFlag("e2b-sandbox") as string | undefined;
-
+			const syncFiles = pi.getFlag("e2b-sync") as boolean;
+			await initialiseSandbox(apiKey, template, existingSandboxId, ctx, syncFiles);
+		} catch (err) {
+			sandboxEnabled = false;
+			sandbox = null;
+			safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "error", "󰅙 E2B: Failed to initialise"));
 			updateWidget(ctx);
-
-			if (!e2bFlag && !existingSandboxId) return;
-
-			const apiKey = process.env.E2B_API_KEY;
-			if (!apiKey) {
-				safeNotify(ctx, "E2B_API_KEY environment variable is not set!", "error");
-				return;
-			}
-
-			try {
-				const syncFiles = pi.getFlag("e2b-sync") as boolean;
-				await initialiseSandbox(apiKey, template, existingSandboxId, ctx, syncFiles);
-			} catch (err) {
-				sandboxEnabled = false;
-				sandbox = null;
-				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "error", "󰅙 E2B: Failed to initialise"));
-				updateWidget(ctx);
-				safeNotify(ctx,
-					`E2B sandbox initialisation failed: ${err instanceof Error ? err.message : err}`,
-					"error",
-				);
-			}
-		} catch (outerErr) {
-			// Prevent any unhandled error from crashing pi
-			try {
-				safeNotify(ctx, `E2B extension error: ${outerErr instanceof Error ? outerErr.message : outerErr}`, "error");
-			} catch {}
+			safeNotify(ctx,
+				`E2B sandbox initialisation failed: ${err instanceof Error ? err.message : err}`,
+				"error",
+			);
 		}
 	});
 
@@ -895,38 +885,13 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Tear down old sandbox
-			stopKeepalive();
+			// Tear down old sandbox if active
 			if (sandbox && sandboxEnabled) {
-				try {
-					await sandbox.kill();
-				} catch {}
+				await teardownSandbox(ctx);
 			}
-			sandbox = null;
-			sandboxEnabled = false;
-
-			safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Connecting to ${newId}…`));
 
 			try {
-				sandbox = await Sandbox.connect(newId, { apiKey });
-				sandboxId = newId;
-				sandboxTemplate = "reconnected";
-				startedAt = new Date();
-				sandboxEnabled = true;
-
-				// Re-register tools with new sandbox reference
-				const remoteCwd = REMOTE_PROJECT_DIR;
-				pi.registerTool({ ...createReadTool(remoteCwd, { operations: createE2bReadOps(getSandbox) }), label: "read (E2B)" });
-				pi.registerTool({ ...createWriteTool(remoteCwd, { operations: createE2bWriteOps(getSandbox) }), label: "write (E2B)" });
-				pi.registerTool({ ...createEditTool(remoteCwd, { operations: createE2bEditOps(getSandbox) }), label: "edit (E2B)" });
-				pi.registerTool({ ...createBashTool(remoteCwd, { operations: createE2bBashOps(getSandbox) }), label: "bash (E2B)" });
-				pi.registerTool({ ...createLsTool(remoteCwd, { operations: createE2bLsOps(getSandbox) }), label: "ls (E2B)" });
-				pi.registerTool({ ...createFindTool(remoteCwd, { operations: createE2bFindOps(getSandbox) }), label: "find (E2B)" });
-
-				startKeepalive();
-
-				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "accent", `󰅟 E2B: ${sandboxId} (reconnected)`));
-				safeNotify(ctx, `Connected to sandbox: ${sandboxId}`, "info");
+				await initialiseSandbox(apiKey, undefined, newId, ctx, false);
 			} catch (err) {
 				sandboxEnabled = false;
 				sandbox = null;
