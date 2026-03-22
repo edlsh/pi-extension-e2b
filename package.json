@@ -1,0 +1,43 @@
+{
+	"name": "pi-extension-e2b",
+	"version": "1.0.0",
+	"description": "E2B cloud sandbox integration for pi — redirects all tool execution to a remote E2B sandbox",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"e2b",
+		"sandbox",
+		"cloud"
+	],
+	"license": "MIT",
+	"author": "edlsh",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/edlsh/pi-extension-e2b"
+	},
+	"files": [
+		"index.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"clean": "echo 'nothing to clean'",
+		"build": "echo 'nothing to build'",
+		"check": "echo 'nothing to check'"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"dependencies": {
+		"e2b": "^1.2.0"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "*",
+		"@sinclair/typebox": "*"
+	}
+}
