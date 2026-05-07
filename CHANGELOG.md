@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0] - 2026-05-07
+
+### Changed
+
+- Updated peer dependency and references for the move to `earendil-works/pi-mono` and `@earendil-works/*` package scopes. `@mariozechner/pi-coding-agent` peer dep is now `@earendil-works/pi-coding-agent`.
+
+### Fixed
+
+- Close abort-signal race window when killing bash command handles (signal could fire between handle creation and listener registration).
+- Stop the sandbox keepalive timer after 3 consecutive `setTimeout` failures so a dead sandbox no longer keeps polling, and `unref()` the timer so it doesn't block clean Node exit.
+- Wrap sandbox connect/create in try/catch so creation errors surface cleanly instead of leaking partial state.
+
 ## [1.0.0] - 2026-03-22
 
 _Initial release._
@@ -17,3 +29,4 @@ _Initial release._
 - `user_bash` event hook to redirect `!` shell commands to the sandbox
 
 [1.0.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.0.0
+[1.1.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.1.0

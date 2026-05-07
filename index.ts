@@ -29,7 +29,7 @@
  */
 
 import { Sandbox } from "e2b";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
 	type ReadOperations,
@@ -48,7 +48,7 @@ import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	formatSize,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { execSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
@@ -146,6 +146,12 @@ function createE2bBashOps(getSandbox: () => Sandbox): BashOperations {
 				handle.kill().catch(() => {});
 			};
 			signal?.addEventListener("abort", onAbort, { once: true });
+
+			// Close the race window: if signal fired between handle creation and listener registration
+			if (signal?.aborted) {
+				handle.kill().catch(() => {});
+				throw new Error("aborted");
+			}
 
 			// Extra timeout guard (in case E2B's built-in timeout doesn't fire)
 			let timedOut = false;
@@ -381,13 +387,25 @@ export default function (pi: ExtensionAPI) {
 	// Helper: start keepalive timer
 	function startKeepalive() {
 		stopKeepalive();
+		let consecutiveFailures = 0;
 		keepaliveTimer = setInterval(async () => {
 			if (sandbox) {
 				try {
 					await sandbox.setTimeout(SANDBOX_TIMEOUT_MS);
-				} catch {}
+					consecutiveFailures = 0;
+				} catch {
+					consecutiveFailures++;
+					if (consecutiveFailures >= 3) {
+						// Sandbox is likely dead — stop polling
+						stopKeepalive();
+					}
+				}
 			}
 		}, KEEPALIVE_INTERVAL_MS);
+		// Don't prevent Node from exiting cleanly
+		if (typeof keepaliveTimer === "object" && keepaliveTimer && "unref" in keepaliveTimer) {
+			(keepaliveTimer as NodeJS.Timeout).unref();
+		}
 	}
 
 	function stopKeepalive() {
@@ -453,208 +471,225 @@ export default function (pi: ExtensionAPI) {
 		ctx: { ui: any; hasUI?: boolean },
 		syncFiles: boolean = false,
 	) {
-		// 1. Create or reconnect ─────────────────────────────────────────────────
-
-		if (existingSandboxId) {
-			safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Connecting to ${existingSandboxId}…`));
-			sandbox = await Sandbox.connect(existingSandboxId, { apiKey });
-			sandboxId = existingSandboxId;
-			sandboxTemplate = "reconnected";
-		} else {
-			sandboxTemplate = template || "base";
-			safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Creating ${sandboxTemplate} sandbox…`));
-			sandbox = template
-				? await Sandbox.create(template, { apiKey, timeoutMs: SANDBOX_TIMEOUT_MS })
-				: await Sandbox.create({ apiKey, timeoutMs: SANDBOX_TIMEOUT_MS });
-			sandboxId = sandbox.sandboxId;
-		}
-
-		startedAt = new Date();
-		sandboxEnabled = true;
-
-		// Ensure remote project directory exists (even without file sync)
-		await sandbox.commands.run(`mkdir -p ${REMOTE_PROJECT_DIR}`, { timeoutMs: 10_000 });
-
-		// 2. Sync files (only when --e2b-sync is passed) ────────────────────────
-
-		if (syncFiles) {
-			safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Syncing files to ${sandboxId}…`));
-			try {
-				const sync = await syncLocalToSandbox(sandbox, localCwd);
-				safeNotify(ctx, `E2B Sandbox ready! (${sandboxId})\n  󰉋 ${sync.fileCount} files synced (${sync.size})`, "info");
-			} catch (syncErr) {
-				safeNotify(ctx,
-					`E2B sandbox ready but file sync failed: ${syncErr instanceof Error ? syncErr.message : syncErr}\nUse /e2b-upload to sync files manually.`,
-					"warning",
-				);
-			}
-		} else {
-			safeNotify(ctx, `E2B Sandbox ready! (${sandboxId})\n  󰉋 No file sync (use --e2b-sync or /e2b-upload to sync files)`, "info");
-		}
-
-		// 3. Install ripgrep (for grep tool) ─────────────────────────────────────
-
 		try {
-			await sandbox.commands.run(
-				"which rg >/dev/null 2>&1 || (apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ripgrep >/dev/null 2>&1)",
-				{ timeoutMs: 120_000 },
-			);
-		} catch {
-			// grep will fall back to plain grep
-		}
+			// 1. Create or reconnect ─────────────────────────────────────────────────
 
-		// 4. Register tool overrides ─────────────────────────────────────────────
+			if (existingSandboxId) {
+				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Connecting to ${existingSandboxId}…`));
+				sandbox = await Sandbox.connect(existingSandboxId, { apiKey });
+				sandboxId = existingSandboxId;
+				sandboxTemplate = "reconnected";
+			} else {
+				sandboxTemplate = template || "base";
+				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Creating ${sandboxTemplate} sandbox…`));
+				sandbox = template
+					? await Sandbox.create(template, { apiKey, timeoutMs: SANDBOX_TIMEOUT_MS })
+					: await Sandbox.create({ apiKey, timeoutMs: SANDBOX_TIMEOUT_MS });
+				sandboxId = sandbox.sandboxId;
+			}
 
-		const remoteCwd = REMOTE_PROJECT_DIR;
+			startedAt = new Date();
+			sandboxEnabled = true;
 
-		pi.registerTool({
-			...createReadTool(remoteCwd, { operations: createE2bReadOps(getSandbox) }),
-			label: "read (E2B)",
-		});
+			// Ensure remote project directory exists (even without file sync)
+			await sandbox.commands.run(`mkdir -p ${REMOTE_PROJECT_DIR}`, { timeoutMs: 10_000 });
 
-		pi.registerTool({
-			...createWriteTool(remoteCwd, { operations: createE2bWriteOps(getSandbox) }),
-			label: "write (E2B)",
-		});
+			// 2. Sync files (only when --e2b-sync is passed) ────────────────────────
 
-		pi.registerTool({
-			...createEditTool(remoteCwd, { operations: createE2bEditOps(getSandbox) }),
-			label: "edit (E2B)",
-		});
-
-		pi.registerTool({
-			...createBashTool(remoteCwd, { operations: createE2bBashOps(getSandbox) }),
-			label: "bash (E2B)",
-		});
-
-		pi.registerTool({
-			...createLsTool(remoteCwd, { operations: createE2bLsOps(getSandbox) }),
-			label: "ls (E2B)",
-		});
-
-		pi.registerTool({
-			...createFindTool(remoteCwd, { operations: createE2bFindOps(getSandbox) }),
-			label: "find (E2B)",
-		});
-
-		// Grep – full override (built-in grep spawns local rg, won't reach sandbox)
-		pi.registerTool({
-			name: "grep",
-			label: "grep (E2B)",
-			description: `Search file contents for a pattern inside the E2B sandbox. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${GREP_DEFAULT_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to 500 chars.`,
-			parameters: Type.Object({
-				pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
-				path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
-				glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
-				ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
-				literal: Type.Optional(
-					Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" }),
-				),
-				context: Type.Optional(
-					Type.Number({ description: "Number of lines to show before and after each match (default: 0)" }),
-				),
-				limit: Type.Optional(
-					Type.Number({ description: "Maximum number of matches to return (default: 100)" }),
-				),
-			}),
-			async execute(
-				_toolCallId: string,
-				params: {
-					pattern: string;
-					path?: string;
-					glob?: string;
-					ignoreCase?: boolean;
-					literal?: boolean;
-					context?: number;
-					limit?: number;
-				},
-				signal?: AbortSignal,
-			) {
-				if (signal?.aborted) throw new Error("Operation aborted");
-
-				const sbx = getSandbox();
-				const limit = params.limit ?? GREP_DEFAULT_LIMIT;
-				const searchPath = params.path
-					? params.path.startsWith("/")
-						? params.path
-						: `${remoteCwd}/${params.path.replace(/^@/, "")}`
-					: remoteCwd;
-
-				// Build rg args
-				const args: string[] = ["--line-number", "--color=never", "--hidden"];
-				if (params.ignoreCase) args.push("--ignore-case");
-				if (params.literal) args.push("--fixed-strings");
-				if (params.glob) args.push("--glob", sq(params.glob));
-				if (params.context && params.context > 0) args.push(`-C${params.context}`);
-				args.push(`-m${limit}`);
-				args.push("--", sq(params.pattern), sq(searchPath));
-
-				// Fallback: grep -rn
-				const fallbackArgs: string[] = ["-rn"];
-				if (params.ignoreCase) fallbackArgs.push("-i");
-				if (params.literal) fallbackArgs.push("-F");
-				fallbackArgs.push(sq(params.pattern), sq(searchPath));
-
-				const cmd = `(rg ${args.join(" ")} 2>/dev/null || grep ${fallbackArgs.join(" ")} 2>/dev/null) | head -n ${limit}; true`;
-
-				let output: string;
+			if (syncFiles) {
+				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Syncing files to ${sandboxId}…`));
 				try {
-					const result = await sbx.commands.run(cmd, { timeoutMs: 30_000 });
-					output = (result.stdout || "").trim();
-				} catch (err: any) {
-					output = (typeof err?.stdout === "string" ? err.stdout : "").trim();
+					const sync = await syncLocalToSandbox(sandbox, localCwd);
+					safeNotify(ctx, `E2B Sandbox ready! (${sandboxId})\n  󰉋 ${sync.fileCount} files synced (${sync.size})`, "info");
+				} catch (syncErr) {
+					safeNotify(ctx,
+						`E2B sandbox ready but file sync failed: ${syncErr instanceof Error ? syncErr.message : syncErr}\nUse /e2b-upload to sync files manually.`,
+						"warning",
+					);
 				}
+			} else {
+				safeNotify(ctx, `E2B Sandbox ready! (${sandboxId})\n  󰉋 No file sync (use --e2b-sync or /e2b-upload to sync files)`, "info");
+			}
 
-				if (!output) {
-					return { content: [{ type: "text" as const, text: "No matches found" }] };
-				}
+			// 3. Install ripgrep (for grep tool) ─────────────────────────────────────
 
-				// Relativise paths
-				const prefix = searchPath.endsWith("/") ? searchPath : searchPath + "/";
-				const lines = output.split("\n").map((line: string) => {
-					if (line.startsWith(prefix)) return line.slice(prefix.length);
-					return line;
-				});
+			try {
+				await sandbox.commands.run(
+					"which rg >/dev/null 2>&1 || (apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq ripgrep >/dev/null 2>&1)",
+					{ timeoutMs: 120_000 },
+				);
+			} catch {
+				// grep will fall back to plain grep
+			}
 
-				const raw = lines.join("\n");
-				const truncation = truncateHead(raw, { maxLines: DEFAULT_MAX_LINES });
-				let text = truncation.content;
+			// 4. Register tool overrides ─────────────────────────────────────────────
 
-				if (truncation.truncated) {
-					text += `\n\n[Output truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]`;
-				}
+			const remoteCwd = REMOTE_PROJECT_DIR;
 
-				return { content: [{ type: "text" as const, text }] };
-			},
-		});
+			pi.registerTool({
+				...createReadTool(remoteCwd, { operations: createE2bReadOps(getSandbox) }),
+				label: "read (E2B)",
+			});
 
-		// 5. e2b_port_url – LLM-callable ─────────────────────────────────────────
+			pi.registerTool({
+				...createWriteTool(remoteCwd, { operations: createE2bWriteOps(getSandbox) }),
+				label: "write (E2B)",
+			});
 
-		pi.registerTool({
-			name: "e2b_port_url",
-			label: "E2B Port URL",
-			description:
-				"Get the public URL to access a port running inside the E2B sandbox (e.g. for web servers, APIs, databases).",
-			promptSnippet: "Get public URL for an E2B sandbox port (web servers, APIs)",
-			parameters: Type.Object({
-				port: Type.Number({ description: "Port number running in the sandbox" }),
-			}),
-			async execute(_toolCallId: string, params: { port: number }) {
-				const sbx = getSandbox();
-				const host = sbx.getHost(params.port);
-				return {
-					content: [{ type: "text" as const, text: `https://${host}` }],
-					details: { port: params.port, host },
-				};
-			},
-		});
+			pi.registerTool({
+				...createEditTool(remoteCwd, { operations: createE2bEditOps(getSandbox) }),
+				label: "edit (E2B)",
+			});
 
-		// 6. Keepalive ───────────────────────────────────────────────────────────
+			pi.registerTool({
+				...createBashTool(remoteCwd, { operations: createE2bBashOps(getSandbox) }),
+				label: "bash (E2B)",
+			});
 
-		startKeepalive();
+			pi.registerTool({
+				...createLsTool(remoteCwd, { operations: createE2bLsOps(getSandbox) }),
+				label: "ls (E2B)",
+			});
 
-		safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "accent", `󰅟 E2B: ${sandboxId} (${sandboxTemplate})`));
-		updateWidget(ctx);
+			pi.registerTool({
+				...createFindTool(remoteCwd, { operations: createE2bFindOps(getSandbox) }),
+				label: "find (E2B)",
+			});
+
+			// Grep – full override (built-in grep spawns local rg, won't reach sandbox)
+			pi.registerTool({
+				name: "grep",
+				label: "grep (E2B)",
+				description: `Search file contents for a pattern inside the E2B sandbox. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${GREP_DEFAULT_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to 500 chars.`,
+				parameters: Type.Object({
+					pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
+					path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
+					glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
+					ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
+					literal: Type.Optional(
+						Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" }),
+					),
+					context: Type.Optional(
+						Type.Number({ description: "Number of lines to show before and after each match (default: 0)" }),
+					),
+					limit: Type.Optional(
+						Type.Number({ description: "Maximum number of matches to return (default: 100)" }),
+					),
+				}),
+				async execute(
+					_toolCallId: string,
+					params: {
+						pattern: string;
+						path?: string;
+						glob?: string;
+						ignoreCase?: boolean;
+						literal?: boolean;
+						context?: number;
+						limit?: number;
+					},
+					signal?: AbortSignal,
+				) {
+					if (signal?.aborted) throw new Error("Operation aborted");
+
+					const sbx = getSandbox();
+					const limit = params.limit ?? GREP_DEFAULT_LIMIT;
+					const searchPath = params.path
+						? params.path.startsWith("/")
+							? params.path
+							: `${remoteCwd}/${params.path.replace(/^@/, "")}`
+						: remoteCwd;
+
+					// Build rg args
+					const args: string[] = ["--line-number", "--color=never", "--hidden"];
+					if (params.ignoreCase) args.push("--ignore-case");
+					if (params.literal) args.push("--fixed-strings");
+					if (params.glob) args.push("--glob", sq(params.glob));
+					if (params.context && params.context > 0) args.push(`-C${params.context}`);
+					args.push(`-m${limit}`);
+					args.push("--", sq(params.pattern), sq(searchPath));
+
+					// Fallback: grep -rn
+					const fallbackArgs: string[] = ["-rn"];
+					if (params.ignoreCase) fallbackArgs.push("-i");
+					if (params.literal) fallbackArgs.push("-F");
+					fallbackArgs.push(sq(params.pattern), sq(searchPath));
+
+					const cmd = `(rg ${args.join(" ")} 2>/dev/null || grep ${fallbackArgs.join(" ")} 2>/dev/null) | head -n ${limit}; true`;
+
+					let output: string;
+					try {
+						const result = await sbx.commands.run(cmd, { timeoutMs: 30_000 });
+						output = (result.stdout || "").trim();
+					} catch (err: any) {
+						output = (typeof err?.stdout === "string" ? err.stdout : "").trim();
+					}
+
+					if (!output) {
+						return { content: [{ type: "text" as const, text: "No matches found" }] };
+					}
+
+					// Relativise paths
+					const prefix = searchPath.endsWith("/") ? searchPath : searchPath + "/";
+					const lines = output.split("\n").map((line: string) => {
+						if (line.startsWith(prefix)) return line.slice(prefix.length);
+						return line;
+					});
+
+					const raw = lines.join("\n");
+					const truncation = truncateHead(raw, { maxLines: DEFAULT_MAX_LINES });
+					let text = truncation.content;
+
+					if (truncation.truncated) {
+						text += `\n\n[Output truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]`;
+					}
+
+					return { content: [{ type: "text" as const, text }] };
+				},
+			});
+
+			// 5. e2b_port_url – LLM-callable ─────────────────────────────────────────
+
+			pi.registerTool({
+				name: "e2b_port_url",
+				label: "E2B Port URL",
+				description:
+					"Get the public URL to access a port running inside the E2B sandbox (e.g. for web servers, APIs, databases).",
+				promptSnippet: "Get public URL for an E2B sandbox port (web servers, APIs)",
+				parameters: Type.Object({
+					port: Type.Number({ description: "Port number running in the sandbox", minimum: 1, maximum: 65535 }),
+				}),
+				async execute(_toolCallId: string, params: { port: number }) {
+					if (!Number.isInteger(params.port) || params.port < 1 || params.port > 65535) {
+						throw new Error(`Invalid port number: ${params.port} (must be 1-65535)`);
+					}
+					const sbx = getSandbox();
+					const host = sbx.getHost(params.port);
+					return {
+						content: [{ type: "text" as const, text: `https://${host}` }],
+						details: { port: params.port, host },
+					};
+				},
+			});
+
+			// 6. Keepalive ───────────────────────────────────────────────────────────
+
+			startKeepalive();
+
+			safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "accent", `󰅟 E2B: ${sandboxId} (${sandboxTemplate})`));
+			updateWidget(ctx);
+		} catch (initErr) {
+			// Sandbox may or may not have been created — kill it if it exists
+			stopKeepalive();
+			if (sandbox) {
+				try { await sandbox.kill(); } catch {}
+			}
+			sandbox = null;
+			sandboxEnabled = false;
+			sandboxId = null;
+			sandboxTemplate = null;
+			startedAt = null;
+			throw initErr;
+		}
 	}
 
 	// ── Keyboard shortcut: Ctrl+Shift+E to toggle ──────────────────────────────
@@ -740,6 +775,9 @@ export default function (pi: ExtensionAPI) {
 			} catch {}
 			sandbox = null;
 			sandboxEnabled = false;
+			sandboxId = null;
+			sandboxTemplate = null;
+			startedAt = null;
 		}
 	});
 
@@ -825,8 +863,11 @@ export default function (pi: ExtensionAPI) {
 
 			const parts = args.trim().split(/\s+/);
 			const localPath = nodePath.resolve(localCwd, parts[0]);
+			if (!localPath.startsWith(localCwd + nodePath.sep) && localPath !== localCwd) {
+				safeNotify(ctx, `Path escapes project directory: ${parts[0]}`, "error");
+				return;
+			}
 			const remotePath = parts[1] || `${REMOTE_PROJECT_DIR}/${parts[0]}`;
-
 			if (!existsSync(localPath)) {
 				safeNotify(ctx, `Local file not found: ${localPath}`, "error");
 				return;
@@ -834,6 +875,11 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				const content = readFileSync(localPath);
+				// Ensure parent directory exists on remote
+				const remoteDir = remotePath.substring(0, remotePath.lastIndexOf("/"));
+				if (remoteDir) {
+					await sandbox.commands.run(`mkdir -p ${sq(remoteDir)}`, { timeoutMs: 10_000 });
+				}
 				await sandbox.files.write(remotePath, new Blob([content]));
 				safeNotify(ctx, `Uploaded: ${parts[0]} → ${remotePath} (${formatSize(content.length)})`, "info");
 			} catch (err) {
@@ -858,6 +904,10 @@ export default function (pi: ExtensionAPI) {
 			const parts = args.trim().split(/\s+/);
 			const remotePath = parts[0].startsWith("/") ? parts[0] : `${REMOTE_PROJECT_DIR}/${parts[0]}`;
 			const localPath = nodePath.resolve(localCwd, parts[1] || parts[0]);
+			if (!localPath.startsWith(localCwd + nodePath.sep) && localPath !== localCwd) {
+				safeNotify(ctx, `Path escapes project directory: ${parts[1] || parts[0]}`, "error");
+				return;
+			}
 
 			try {
 				const bytes = await sandbox.files.read(remotePath, { format: "bytes" });
@@ -896,6 +946,7 @@ export default function (pi: ExtensionAPI) {
 				sandboxEnabled = false;
 				sandbox = null;
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "error", "󰅙 E2B: Connection failed"));
+				updateWidget(ctx);
 				safeNotify(ctx, `Failed to connect: ${err instanceof Error ? err.message : err}`, "error");
 			}
 		},

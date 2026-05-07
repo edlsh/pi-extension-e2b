@@ -1,6 +1,6 @@
 # pi-extension-e2b
 
-E2B cloud sandbox integration for [pi](https://github.com/badlogic/pi-mono). Redirects all tool execution (bash, read, write, edit, ls, find, grep) to an [E2B](https://e2b.dev) cloud sandbox, giving the agent a full Linux environment with internet access — completely isolated from your local machine.
+E2B cloud sandbox integration for [pi](https://github.com/earendil-works/pi-mono). Redirects all tool execution (bash, read, write, edit, ls, find, grep) to an [E2B](https://e2b.dev) cloud sandbox, giving the agent a full Linux environment with internet access — completely isolated from your local machine.
 
 ## Install
 
