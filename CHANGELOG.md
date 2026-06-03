@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.2.0] - 2026-06-03
+
+### Added
+
+- `promptGuidelines` on the `e2b_port_url` tool — guideline bullets are now appended to the system-prompt Guidelines section automatically, replacing the ad-hoc system-prompt append.
+- Terminal window/tab title is set to `π E2B: <sandboxId>` while a sandbox is active (TUI mode only); restored to `π` on disable.
+- Streaming working-message indicator shows `Starting E2B sandbox…` / `Connecting to E2B sandbox…` / `Syncing project files to E2B sandbox…` during the sandbox lifecycle (TUI mode only).
+- Interactive `ui.input()` prompt when `/e2b-reconnect` is called without a sandbox ID.
+- Interactive `ui.select()` template picker on `Ctrl+Shift+E` enable when no `--e2b-template` flag is set.
+- `session_before_fork` confirmation dialog warning that both forks will share the same sandbox.
+- Context-usage percent (`· ctx NN%`) is appended to the E2B status widget when available.
+
+### Changed
+
+- `safeNotify` / `safeSetStatus` / `safeSetWidget` / `safeThemeFg` / `updateWidget` / `initialiseSandbox` / `teardownSandbox` now use the typed `ExtensionContext` (and `UICtx = Pick<ExtensionContext, "ui" | "hasUI">`) instead of `(ctx as any).hasUI` guards.
+- Peer dependency on `@earendil-works/pi-coding-agent` bumped to `>=0.78.0` to gate on `promptGuidelines`, `ctx.getContextUsage()`, `ui.setTitle`, `ui.setWorkingMessage`, `ui.input`, `ui.select`, and the `session_before_fork` event.
+
+### Fixed
+
+- All Buffer uploads to the sandbox (the write tool, project file sync, and `/e2b-upload`) now go through a shared `bufferToArrayBuffer` helper that copies into a fresh `ArrayBuffer` and passes it directly to `sbx.files.write`, rather than wrapping in `new Blob([buffer])`. The previous form failed strict-mode type-check because `Buffer<ArrayBufferLike>` is not assignable to `BlobPart`.
+- Custom `grep` tool result objects now include `details: undefined` to satisfy the required `AgentToolResult.details` field.
+
 ## [1.1.0] - 2026-05-07
 
 ### Changed
@@ -30,3 +52,4 @@ _Initial release._
 
 [1.0.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.0.0
 [1.1.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.1.0
+[1.2.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.2.0

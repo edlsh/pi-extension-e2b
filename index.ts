@@ -29,7 +29,7 @@
  */
 
 import { Sandbox } from "e2b";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
 	type ReadOperations,
@@ -72,6 +72,16 @@ function sq(s: string): string {
 	return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+// e2b's files.write types its binary input as `ArrayBuffer | Blob | …`, but a Node
+// Buffer is `Uint8Array<ArrayBufferLike>` (its backing store may be a SharedArrayBuffer),
+// which is not assignable to those types under strict mode. Copy into a fresh
+// ArrayBuffer so the payload is always a plain, owned buffer.
+function bufferToArrayBuffer(buf: Buffer): ArrayBuffer {
+	const ab = new ArrayBuffer(buf.byteLength);
+	new Uint8Array(ab).set(buf);
+	return ab;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // E2B Operations – thin adapters over the E2B SDK
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -108,7 +118,7 @@ function createE2bWriteOps(getSandbox: () => Sandbox): WriteOperations {
 		writeFile: async (p: string, content: string | Buffer) => {
 			const sbx = getSandbox();
 			if (Buffer.isBuffer(content)) {
-				await sbx.files.write(p, new Blob([content]));
+				await sbx.files.write(p, bufferToArrayBuffer(content));
 			} else {
 				await sbx.files.write(p, content);
 			}
@@ -275,7 +285,7 @@ async function syncLocalToSandbox(
 		const sizeStr = formatSize(tarBuffer.length);
 
 		// Upload archive
-		await sbx.files.write("/tmp/project-sync.tar.gz", new Blob([tarBuffer]));
+		await sbx.files.write("/tmp/project-sync.tar.gz", bufferToArrayBuffer(tarBuffer));
 
 		// Create project dir and extract
 		await sbx.commands.run(
@@ -307,7 +317,9 @@ async function syncLocalToSandbox(
 // Safe UI helpers – prevent crashes when ctx.hasUI is false
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function safeThemeFg(ctx: { ui: any; hasUI?: boolean }, color: string, text: string): string {
+type UICtx = Pick<ExtensionContext, "ui" | "hasUI">;
+
+function safeThemeFg(ctx: UICtx, color: ThemeColor, text: string): string {
 	try {
 		return ctx.ui?.theme?.fg?.(color, text) ?? text;
 	} catch {
@@ -315,28 +327,33 @@ function safeThemeFg(ctx: { ui: any; hasUI?: boolean }, color: string, text: str
 	}
 }
 
-function safeNotify(ctx: { ui: any; hasUI?: boolean }, message: string, level: string) {
-	try {
-		if ((ctx as any).hasUI !== false) {
-			ctx.ui.notify(message, level);
-		}
-	} catch {}
+function safeNotify(ctx: UICtx, message: string, level: "info" | "warning" | "error") {
+	if (!ctx.hasUI) return;
+	try { ctx.ui.notify(message, level); } catch {}
 }
 
-function safeSetStatus(ctx: { ui: any; hasUI?: boolean }, key: string, text: string | undefined) {
-	try {
-		if ((ctx as any).hasUI !== false) {
-			ctx.ui.setStatus(key, text);
-		}
-	} catch {}
+function safeSetStatus(ctx: UICtx, key: string, text: string | undefined) {
+	if (!ctx.hasUI) return;
+	try { ctx.ui.setStatus(key, text); } catch {}
 }
 
-function safeSetWidget(ctx: { ui: any; hasUI?: boolean }, key: string, content: string[] | undefined) {
-	try {
-		if ((ctx as any).hasUI !== false) {
-			ctx.ui.setWidget(key, content);
-		}
-	} catch {}
+function safeSetWidget(ctx: UICtx, key: string, content: string[] | undefined) {
+	if (!ctx.hasUI) return;
+	try { ctx.ui.setWidget(key, content); } catch {}
+}
+
+// setTitle / setWorkingMessage are TUI-only. In @earendil-works/pi-coding-agent
+// 0.78.0, hasUI is documented as "false in print/RPC mode" — i.e. equivalent to
+// a TUI-only gate. Wrapping in try/catch keeps us safe if future versions widen
+// hasUI to include RPC (the methods would simply no-op or throw).
+function safeSetTitle(ctx: UICtx, title: string) {
+	if (!ctx.hasUI) return;
+	try { ctx.ui.setTitle(title); } catch {}
+}
+
+function safeSetWorking(ctx: UICtx, message: string | undefined) {
+	if (!ctx.hasUI) return;
+	try { ctx.ui.setWorkingMessage(message); } catch {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -416,13 +433,15 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Helper: update the persistent widget above the editor
-	function updateWidget(ctx: { ui: any; hasUI?: boolean }) {
+	function updateWidget(ctx: ExtensionContext) {
 		if (sandboxEnabled && sandboxId) {
 			const uptime = startedAt
 				? `${Math.floor((Date.now() - startedAt.getTime()) / 60000)}m`
 				: "?";
+			const usage = ctx.getContextUsage?.();
+			const ctxPct = usage?.percent != null ? ` · ctx ${Math.round(usage.percent)}%` : "";
 			safeSetWidget(ctx, "e2b",
-				[`󰅟 E2B Sandbox: ${sandboxId} (${sandboxTemplate}, ${uptime}) — Ctrl+Shift+E to disable`],
+				[`󰅟 E2B Sandbox: ${sandboxId} (${sandboxTemplate}, ${uptime}${ctxPct}) — Ctrl+Shift+E to disable`],
 			);
 		} else {
 			safeSetWidget(ctx, "e2b",
@@ -443,7 +462,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Helper: tear down the sandbox
-	async function teardownSandbox(ctx: { ui: any; hasUI?: boolean }) {
+	async function teardownSandbox(ctx: ExtensionContext) {
 		stopKeepalive();
 		if (sandbox) {
 			try {
@@ -459,6 +478,8 @@ export default function (pi: ExtensionAPI) {
 		restoreLocalTools();
 
 		safeSetStatus(ctx, "e2b", undefined);
+		safeSetTitle(ctx, "π");
+		safeSetWorking(ctx, undefined);
 		updateWidget(ctx);
 		safeNotify(ctx, "E2B sandbox disabled — tools restored to local execution.", "info");
 	}
@@ -468,7 +489,7 @@ export default function (pi: ExtensionAPI) {
 		apiKey: string,
 		template: string | undefined,
 		existingSandboxId: string | undefined,
-		ctx: { ui: any; hasUI?: boolean },
+		ctx: ExtensionContext,
 		syncFiles: boolean = false,
 	) {
 		try {
@@ -476,12 +497,14 @@ export default function (pi: ExtensionAPI) {
 
 			if (existingSandboxId) {
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Connecting to ${existingSandboxId}…`));
+				safeSetWorking(ctx, `Connecting to E2B sandbox ${existingSandboxId}…`);
 				sandbox = await Sandbox.connect(existingSandboxId, { apiKey });
 				sandboxId = existingSandboxId;
 				sandboxTemplate = "reconnected";
 			} else {
 				sandboxTemplate = template || "base";
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Creating ${sandboxTemplate} sandbox…`));
+				safeSetWorking(ctx, `Starting E2B sandbox (${sandboxTemplate})…`);
 				sandbox = template
 					? await Sandbox.create(template, { apiKey, timeoutMs: SANDBOX_TIMEOUT_MS })
 					: await Sandbox.create({ apiKey, timeoutMs: SANDBOX_TIMEOUT_MS });
@@ -490,6 +513,7 @@ export default function (pi: ExtensionAPI) {
 
 			startedAt = new Date();
 			sandboxEnabled = true;
+			safeSetTitle(ctx, `π E2B: ${sandboxId}`);
 
 			// Ensure remote project directory exists (even without file sync)
 			await sandbox.commands.run(`mkdir -p ${REMOTE_PROJECT_DIR}`, { timeoutMs: 10_000 });
@@ -498,6 +522,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (syncFiles) {
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Syncing files to ${sandboxId}…`));
+				safeSetWorking(ctx, `Syncing project files to E2B sandbox…`);
 				try {
 					const sync = await syncLocalToSandbox(sandbox, localCwd);
 					safeNotify(ctx, `E2B Sandbox ready! (${sandboxId})\n  󰉋 ${sync.fileCount} files synced (${sync.size})`, "info");
@@ -510,6 +535,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				safeNotify(ctx, `E2B Sandbox ready! (${sandboxId})\n  󰉋 No file sync (use --e2b-sync or /e2b-upload to sync files)`, "info");
 			}
+			safeSetWorking(ctx, undefined); // restore default working message
 
 			// 3. Install ripgrep (for grep tool) ─────────────────────────────────────
 
@@ -625,7 +651,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (!output) {
-						return { content: [{ type: "text" as const, text: "No matches found" }] };
+						return { content: [{ type: "text" as const, text: "No matches found" }], details: undefined };
 					}
 
 					// Relativise paths
@@ -643,7 +669,7 @@ export default function (pi: ExtensionAPI) {
 						text += `\n\n[Output truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]`;
 					}
 
-					return { content: [{ type: "text" as const, text }] };
+					return { content: [{ type: "text" as const, text }], details: undefined };
 				},
 			});
 
@@ -655,6 +681,11 @@ export default function (pi: ExtensionAPI) {
 				description:
 					"Get the public URL to access a port running inside the E2B sandbox (e.g. for web servers, APIs, databases).",
 				promptSnippet: "Get public URL for an E2B sandbox port (web servers, APIs)",
+				promptGuidelines: [
+					"You are running inside an E2B cloud sandbox; localhost is not reachable from the user's machine.",
+					"After starting any web server, API, or HTTP service in the sandbox, call e2b_port_url with the port number to obtain its public URL.",
+					"Share the returned URL with the user so they can access the service in their browser.",
+				],
 				parameters: Type.Object({
 					port: Type.Number({ description: "Port number running in the sandbox", minimum: 1, maximum: 65535 }),
 				}),
@@ -688,6 +719,7 @@ export default function (pi: ExtensionAPI) {
 			sandboxId = null;
 			sandboxTemplate = null;
 			startedAt = null;
+			safeSetWorking(ctx, undefined); // restore default working message on failure
 			throw initErr;
 		}
 	}
@@ -713,7 +745,20 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				const template = pi.getFlag("e2b-template") as string | undefined;
+				let template = pi.getFlag("e2b-template") as string | undefined;
+
+				// If no template flag was provided, offer a picker in interactive UI.
+				if (!template && ctx.hasUI) {
+					const BASE = "base (default)";
+					const CUSTOM = "custom…";
+					const choice = await ctx.ui.select("E2B Sandbox Template", [BASE, CUSTOM]);
+					if (choice === undefined) return; // user cancelled
+					if (choice === CUSTOM) {
+						const custom = await ctx.ui.input("Custom Template ID", "e.g. my-template");
+						if (!custom?.trim()) return;
+						template = custom.trim();
+					}
+				}
 
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", "󰑓 E2B: Starting sandbox…"));
 				updateWidget(ctx);
@@ -781,6 +826,18 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Warn before forking — both forks will share the same sandbox
+	pi.on("session_before_fork", async (_event, ctx) => {
+		if (!sandboxEnabled || !sandbox) return;
+		if (!ctx.hasUI) return; // headless: don't block
+		const ok = await ctx.ui.confirm(
+			"Fork session with active E2B sandbox?",
+			`Both the original and forked sessions will share sandbox ${sandboxId}. ` +
+				`Commands run in either session may affect the other. Continue?`,
+		);
+		return ok ? undefined : { cancel: true };
+	});
+
 	// Redirect user ! commands to the sandbox
 	pi.on("user_bash", () => {
 		if (!sandboxEnabled || !sandbox) return;
@@ -798,7 +855,7 @@ export default function (pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				sp +
-				`\n\nYou are operating inside an E2B cloud sandbox (ID: ${sandboxId}). All file operations and commands execute in the remote sandbox, not on the local machine. The sandbox is a full Linux environment with internet access. Use the e2b_port_url tool to get public URLs for any ports you start.`,
+				`\n\nYou are operating inside an E2B cloud sandbox (ID: ${sandboxId}). All file operations and commands execute in the remote sandbox, not on the local machine. The sandbox is a full Linux environment with internet access.`,
 		};
 	});
 
@@ -880,7 +937,7 @@ export default function (pi: ExtensionAPI) {
 				if (remoteDir) {
 					await sandbox.commands.run(`mkdir -p ${sq(remoteDir)}`, { timeoutMs: 10_000 });
 				}
-				await sandbox.files.write(remotePath, new Blob([content]));
+				await sandbox.files.write(remotePath, bufferToArrayBuffer(content));
 				safeNotify(ctx, `Uploaded: ${parts[0]} → ${remotePath} (${formatSize(content.length)})`, "info");
 			} catch (err) {
 				safeNotify(ctx, `Upload failed: ${err instanceof Error ? err.message : err}`, "error");
@@ -923,10 +980,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("e2b-reconnect", {
 		description: "Connect to an existing E2B sandbox by ID",
 		handler: async (args, ctx) => {
-			const newId = args?.trim();
+			let newId = args?.trim();
 			if (!newId) {
-				safeNotify(ctx, "Usage: /e2b-reconnect <sandbox-id>", "info");
-				return;
+				if (!ctx.hasUI) {
+					safeNotify(ctx, "Usage: /e2b-reconnect <sandbox-id>", "info");
+					return;
+				}
+				const input = await ctx.ui.input("Reconnect to E2B sandbox", "Sandbox ID (e.g. sb_xxx)");
+				if (!input?.trim()) return; // user cancelled or empty
+				newId = input.trim();
 			}
 
 			const apiKey = process.env.E2B_API_KEY;
