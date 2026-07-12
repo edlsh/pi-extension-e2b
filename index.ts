@@ -483,7 +483,9 @@ export default function (pi: ExtensionAPI) {
 		if (sandbox) {
 			if (opts.pause) {
 				try {
-					paused = await sandbox.pause();
+					const result = await sandbox.pause();
+					if (!result) throw new Error("sandbox did not confirm pause");
+					paused = true;
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					safeNotify(ctx,
