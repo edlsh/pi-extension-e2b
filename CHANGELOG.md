@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.0.0] - 2026-07-12
+
+### Changed
+
+- **BREAKING:** Updated the e2b SDK from `^1.2.0` to `^2.31.0`. E2B v2 requires Node `>=20.18.1`, is secure by default, and requires custom templates built with envd `<0.2.0` to be rebuilt.
+- **BREAKING:** Raised the pi peer dependency to `>=0.80.0`.
+- Replaced the `@sinclair/typebox` peer/import with `typebox`.
+- Reconnect now extends the sandbox timeout to 60 minutes and reports the real template name instead of `"reconnected"`.
+- Reconnecting to a paused sandbox now resumes it automatically.
+
+### Added
+
+- `--e2b-persist` pauses the sandbox on session end or timeout instead of killing it.
+- `/e2b-pause` pauses the active sandbox and restores local tools.
+- `/e2b-list` lists pi-created running and paused sandboxes with reconnect and kill actions.
+- New sandboxes receive `app=pi-e2b` and `project` metadata tags.
+- `/e2b` now reports sandbox state, expiry, CPU, memory, and disk metrics.
+
+### Internal
+
+- Replaced the no-op `check` script with `tsc --noEmit`.
+- Added pnpm `minimumReleaseAge=10080` and `ignore-scripts=true`.
+
 ## [1.2.0] - 2026-06-03
 
 ### Added
@@ -53,3 +76,4 @@ _Initial release._
 [1.0.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.0.0
 [1.1.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.1.0
 [1.2.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v1.2.0
+[2.0.0]: https://github.com/edlsh/pi-extension-e2b/releases/tag/v2.0.0

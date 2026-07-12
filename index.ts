@@ -7,6 +7,7 @@
  * Usage:
  *   pi --e2b                          # Create new sandbox (no file sync)
  *   pi --e2b --e2b-sync              # Create new sandbox and sync local files
+ *   pi --e2b --e2b-persist           # Pause sandbox on session end or timeout
  *   pi --e2b --e2b-template custom    # Use a custom template
  *   pi --e2b --e2b-sandbox <id>       # Reconnect to an existing sandbox
  *
@@ -14,6 +15,8 @@
  *   /e2b              - Show sandbox status & info
  *   /e2b-upload       - Upload local file(s) to the sandbox
  *   /e2b-download     - Download file(s) from the sandbox
+ *   /e2b-pause        - Pause the sandbox and restore local tools
+ *   /e2b-list         - List, reconnect, or kill pi-created sandboxes
  *   /e2b-reconnect    - Connect to an existing sandbox by ID
  *
  * Custom Tools (LLM-callable):
@@ -28,7 +31,7 @@
  *   3. Set E2B_API_KEY environment variable
  */
 
-import { Sandbox } from "e2b";
+import type { Sandbox, SandboxInfo } from "e2b";
 import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
@@ -49,10 +52,14 @@ import {
 	DEFAULT_MAX_LINES,
 	formatSize,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
+import { createRequire } from "node:module";
 import { execSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import nodePath from "node:path";
+
+type E2BModule = { Sandbox: typeof Sandbox };
+const { Sandbox: E2BSandbox } = createRequire(import.meta.url)("e2b") as E2BModule;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -385,6 +392,12 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
+	pi.registerFlag("e2b-persist", {
+		description: "Pause (instead of kill) the E2B sandbox on session end or timeout so it can be resumed later",
+		type: "boolean",
+		default: false,
+	});
+
 	// ── Shared state ───────────────────────────────────────────────────────────
 
 	const localCwd = process.cwd();
@@ -395,6 +408,7 @@ export default function (pi: ExtensionAPI) {
 	let sandboxTemplate: string | null = null;
 	let startedAt: Date | null = null;
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+	const persistEnabled = () => pi.getFlag("e2b-persist") as boolean;
 
 	const getSandbox = (): Sandbox => {
 		if (!sandbox) throw new Error("E2B sandbox not initialised");
@@ -462,12 +476,26 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Helper: tear down the sandbox
-	async function teardownSandbox(ctx: ExtensionContext) {
+	async function teardownSandbox(ctx: ExtensionContext, opts: { pause?: boolean } = {}) {
 		stopKeepalive();
+		const id = sandboxId ?? sandbox?.sandboxId ?? "unknown";
+		let paused = false;
 		if (sandbox) {
-			try {
-				await sandbox.kill();
-			} catch {}
+			if (opts.pause) {
+				try {
+					paused = await sandbox.pause();
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					safeNotify(ctx,
+						`E2B pause failed (${msg}); sandbox left running (${id}). Reconnect with /e2b-reconnect ${id}.`,
+						"warning",
+					);
+				}
+			} else {
+				try {
+					await sandbox.kill();
+				} catch {}
+			}
 		}
 		sandbox = null;
 		sandboxEnabled = false;
@@ -481,7 +509,11 @@ export default function (pi: ExtensionAPI) {
 		safeSetTitle(ctx, "π");
 		safeSetWorking(ctx, undefined);
 		updateWidget(ctx);
-		safeNotify(ctx, "E2B sandbox disabled — tools restored to local execution.", "info");
+		if (opts.pause && paused) {
+			safeNotify(ctx, `E2B sandbox paused (${id}) — resume with /e2b-reconnect ${id} or /e2b-list.`, "info");
+		} else if (!opts.pause) {
+			safeNotify(ctx, "E2B sandbox disabled — tools restored to local execution.", "info");
+		}
 	}
 
 	// Helper: initialise sandbox & register tools
@@ -498,20 +530,29 @@ export default function (pi: ExtensionAPI) {
 			if (existingSandboxId) {
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Connecting to ${existingSandboxId}…`));
 				safeSetWorking(ctx, `Connecting to E2B sandbox ${existingSandboxId}…`);
-				sandbox = await Sandbox.connect(existingSandboxId, { apiKey });
+				sandbox = await E2BSandbox.connect(existingSandboxId, { apiKey, timeoutMs: SANDBOX_TIMEOUT_MS });
 				sandboxId = existingSandboxId;
-				sandboxTemplate = "reconnected";
+				try {
+					const info = await sandbox.getInfo();
+					sandboxTemplate = info.name ?? info.templateId;
+					startedAt = info.startedAt;
+				} catch {
+					sandboxTemplate = "reconnected";
+					startedAt = new Date();
+				}
 			} else {
 				sandboxTemplate = template || "base";
 				safeSetStatus(ctx, "e2b", safeThemeFg(ctx, "warning", `󰑓 E2B: Creating ${sandboxTemplate} sandbox…`));
 				safeSetWorking(ctx, `Starting E2B sandbox (${sandboxTemplate})…`);
-				sandbox = template
-					? await Sandbox.create(template, { apiKey, timeoutMs: SANDBOX_TIMEOUT_MS })
-					: await Sandbox.create({ apiKey, timeoutMs: SANDBOX_TIMEOUT_MS });
+				sandbox = await E2BSandbox.create(sandboxTemplate, {
+					apiKey,
+					timeoutMs: SANDBOX_TIMEOUT_MS,
+					metadata: { app: "pi-e2b", project: nodePath.basename(localCwd) },
+					...(persistEnabled() ? { lifecycle: { onTimeout: "pause" as const } } : {}),
+				});
 				sandboxId = sandbox.sandboxId;
+				startedAt = new Date();
 			}
-
-			startedAt = new Date();
 			sandboxEnabled = true;
 			safeSetTitle(ctx, `π E2B: ${sandboxId}`);
 
@@ -731,12 +772,15 @@ export default function (pi: ExtensionAPI) {
 		handler: async (ctx) => {
 			if (sandboxEnabled && sandbox) {
 				// ── Disable ─────────────────────────────────────────────────────
+				const pause = persistEnabled();
 				const ok = await ctx.ui.confirm(
-					"Disable E2B Sandbox?",
-					`Kill sandbox ${sandboxId} and restore local tools?`,
+					pause ? "Pause E2B Sandbox?" : "Disable E2B Sandbox?",
+					pause
+						? `Pause sandbox ${sandboxId} (resumable via /e2b-reconnect) and restore local tools?`
+						: `Kill sandbox ${sandboxId} and restore local tools?`,
 				);
 				if (!ok) return;
-				await teardownSandbox(ctx);
+				await teardownSandbox(ctx, { pause });
 			} else {
 				// ── Enable ──────────────────────────────────────────────────────
 				const apiKey = process.env.E2B_API_KEY;
@@ -816,7 +860,11 @@ export default function (pi: ExtensionAPI) {
 		stopKeepalive();
 		if (sandbox && sandboxEnabled) {
 			try {
-				await sandbox.kill();
+				if (persistEnabled()) {
+					await sandbox.pause();
+				} else {
+					await sandbox.kill();
+				}
 			} catch {}
 			sandbox = null;
 			sandboxEnabled = false;
@@ -879,6 +927,21 @@ export default function (pi: ExtensionAPI) {
 				runningProcs = String(procs.length);
 			} catch {}
 
+			let state = "?", expires = "?", cpu = "?", mem = "?", disk = "?";
+			try {
+				const info = await sandbox.getInfo();
+				state = info.state;
+				expires = `in ${Math.max(0, Math.round((info.endAt.getTime() - Date.now()) / 60000))}m`;
+			} catch {}
+			try {
+				const m = (await sandbox.getMetrics()).at(-1);
+				if (m) {
+					cpu = `${Math.round(m.cpuUsedPct)}% of ${m.cpuCount} vCPU`;
+					mem = `${formatSize(m.memUsed)} / ${formatSize(m.memTotal)}`;
+					disk = `${formatSize(m.diskUsed)} / ${formatSize(m.diskTotal)}`;
+				}
+			} catch {}
+
 			const lines = [
 				"󰅟 E2B Sandbox Status",
 				"",
@@ -886,6 +949,11 @@ export default function (pi: ExtensionAPI) {
 				`  Template:   ${sandboxTemplate}`,
 				`  Started:    ${startedAt?.toISOString() || "unknown"}`,
 				`  Uptime:     ${uptime}`,
+				`  State:      ${state}`,
+				`  Expires:    ${expires}`,
+				`  CPU:        ${cpu}`,
+				`  Mem:        ${mem}`,
+				`  Disk:       ${disk}`,
 				`  Remote CWD: ${REMOTE_PROJECT_DIR}`,
 				`  Processes:  ${runningProcs}`,
 				"",
@@ -893,6 +961,8 @@ export default function (pi: ExtensionAPI) {
 				"    /e2b-upload [local-path]               Re-sync all or upload specific file",
 				"    /e2b-download <remote-path> [local]    Download file from sandbox",
 				"    /e2b-reconnect <sandbox-id>            Reconnect to another sandbox",
+				"    /e2b-pause                              Pause and restore local tools",
+				"    /e2b-list                               List, reconnect, or kill sandboxes",
 			];
 			safeNotify(ctx, lines.join("\n"), "info");
 		},
@@ -977,6 +1047,74 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("e2b-list", {
+		description: "List pi-created E2B sandboxes (running & paused); reconnect or kill",
+		handler: async (_args, ctx) => {
+			const apiKey = process.env.E2B_API_KEY;
+			if (!apiKey) {
+				safeNotify(ctx, "E2B_API_KEY not set", "error");
+				return;
+			}
+			let items: SandboxInfo[];
+			try {
+				items = await E2BSandbox.list({
+					apiKey,
+					query: { metadata: { app: "pi-e2b" }, state: ["running", "paused"] },
+				}).nextItems();
+			} catch (err) {
+				safeNotify(ctx, `List failed: ${err instanceof Error ? err.message : err}`, "error");
+				return;
+			}
+			if (items.length === 0) {
+				safeNotify(ctx, "No pi-created E2B sandboxes running or paused.", "info");
+				return;
+			}
+			const label = (s: SandboxInfo) =>
+				`${s.state === "running" ? "▶" : "⏸"} ${s.sandboxId} · ${s.metadata?.project ?? "?"} · ${s.name ?? s.templateId} · ${Math.max(0, Math.round((Date.now() - s.startedAt.getTime()) / 60000))}m`;
+			const labels = items.map(label);
+			if (!ctx.hasUI) {
+				safeNotify(ctx, labels.join("\n"), "info");
+				return;
+			}
+			const choice = await ctx.ui.select("E2B Sandboxes", labels);
+			if (choice === undefined) return;
+			const picked = items[labels.indexOf(choice)];
+			const action = await ctx.ui.select(`Sandbox ${picked.sandboxId} (${picked.state})`, ["Reconnect", "Kill", "Cancel"]);
+			if (action === "Reconnect") {
+				if (picked.sandboxId === sandboxId) {
+					safeNotify(ctx, "Already connected to this sandbox.", "info");
+					return;
+				}
+				if (sandbox && sandboxEnabled) await teardownSandbox(ctx, { pause: persistEnabled() });
+				try {
+					await initialiseSandbox(apiKey, undefined, picked.sandboxId, ctx, false);
+				} catch (err) {
+					safeNotify(ctx, `Reconnect failed: ${err instanceof Error ? err.message : err}`, "error");
+				}
+			} else if (action === "Kill") {
+				if (picked.sandboxId === sandboxId) {
+					safeNotify(ctx, "That's the active sandbox — use Ctrl+Shift+E to disable it.", "warning");
+					return;
+				}
+				try {
+					await E2BSandbox.kill(picked.sandboxId, { apiKey });
+					safeNotify(ctx, `Killed ${picked.sandboxId}`, "info");
+				} catch (err) {
+					safeNotify(ctx, `Kill failed: ${err instanceof Error ? err.message : err}`, "error");
+				}
+			}
+		},
+	});
+	pi.registerCommand("e2b-pause", {
+		description: "Pause the E2B sandbox (resumable later) and restore local tools",
+		handler: async (_args, ctx) => {
+			if (!sandbox || !sandboxEnabled) {
+				safeNotify(ctx, "E2B sandbox not active", "error");
+				return;
+			}
+			await teardownSandbox(ctx, { pause: true });
+		},
+	});
 	pi.registerCommand("e2b-reconnect", {
 		description: "Connect to an existing E2B sandbox by ID",
 		handler: async (args, ctx) => {
@@ -999,7 +1137,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Tear down old sandbox if active
 			if (sandbox && sandboxEnabled) {
-				await teardownSandbox(ctx);
+				await teardownSandbox(ctx, { pause: persistEnabled() });
 			}
 
 			try {
